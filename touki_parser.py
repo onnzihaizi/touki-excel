@@ -1,6 +1,7 @@
 import io
 import re
 import unicodedata
+import calendar
 from datetime import date
 from pypdf import PdfReader
 
@@ -220,6 +221,14 @@ def _months_elapsed(start_iso: str, as_of=None):
     return max(0, months)
 
 
+def _date_after_months(base: date, months: int) -> date:
+    total = base.year * 12 + (base.month - 1) + months
+    y, m0 = divmod(total, 12)
+    m = m0 + 1
+    d = min(base.day, calendar.monthrange(y, m)[1])
+    return date(y, m, d)
+
+
 def estimate_remaining_balance(principal_yen, loan_date_iso: str, annual_rate_pct: float, years: int = 35, as_of=None):
     """元利均等・35年ローン想定の推定残債。円単位で返す。"""
     if not principal_yen or principal_yen <= 0 or not loan_date_iso:
@@ -253,6 +262,46 @@ def calculate_monthly_payment(principal_yen, annual_rate_pct: float, years: int 
         payment = principal * monthly_rate / (1 - (1 + monthly_rate) ** (-total_months))
     return max(0, int(round(payment)))
 
+
+def _extract_party_name(flat: str, label: str):
+    """権利部の「所有者」「債務者」から氏名/法人名らしい末尾部分を取得。"""
+    pos = flat.find(label)
+    if pos < 0:
+        return ""
+    tail = flat[pos + len(label):]
+    # 次の権利関係ラベルまでを対象にする。
+    tail = re.split(r"抵当権者|根抵当権者|債権額|極度額|利息|損害金|共同担保|順位\d+番|住所変更", tail)[0]
+    # 法人は法人格を含む名称を優先。
+    for form in ("株式会社", "有限会社", "合同会社", "合資会社", "合名会社"):
+        m = re.search(form + r"[一-龥々ぁ-んァ-ヶーA-Za-z0-9・ー]+", tail)
+        if m:
+            return m.group(0)
+        idx = tail.find(form)
+        if idx >= 0:
+            before = tail[:idx]
+            # 住所末尾の号/番地より後ろを会社名候補にする。
+            for marker in ("号", "番地"):
+                if marker in before:
+                    before = before.rsplit(marker, 1)[-1]
+            m2 = re.search(r"([一-龥々ぁ-んァ-ヶーA-Za-z0-9・ー]{1,50})$", before)
+            if m2:
+                return m2.group(1) + form
+    # 個人名は住所の末尾（号/番地等）以降に残る日本語文字列を採用。
+    cleaned = tail
+    for marker in ("号", "番地"):
+        if marker in cleaned:
+            cleaned = cleaned.rsplit(marker, 1)[-1]
+    # 数字・記号を除いた末尾の連続文字列。通常は「藤岡綱昭」「米谷俊輔」等。
+    candidates = re.findall(r"[一-龥々ぁ-んァ-ヶー]{2,30}", cleaned)
+    return candidates[-1] if candidates else ""
+
+
+def _same_party(a: str, b: str) -> bool:
+    def norm(x):
+        return re.sub(r"[\s　・･,，.．\-ー]", "", unicodedata.normalize("NFKC", x or ""))
+    aa, bb = norm(a), norm(b)
+    return bool(aa and bb and aa == bb)
+
 def analyze_registry(pdf_text: str) -> dict:
     t = normalize(pdf_text)
     warnings = []
@@ -263,7 +312,17 @@ def analyze_registry(pdf_text: str) -> dict:
     otsu = _slice(t, "権利部(乙区)", [])
 
     property_name = _first_field(one, "建物の名称")
-    room = _first_field(unit, "建物の名称")
+    # 部屋番号は「建物の名称」ではなく、専有部分の「家屋番号」の末尾から取得する。
+    # 例: 神泉町8番7の502 → 502
+    house_number = _first_field(unit, "家屋番号")
+    room = ""
+    m_room = re.search(r"(?:の|ノ)(\d+)$", house_number or "")
+    if m_room:
+        room = m_room.group(1)
+    elif house_number:
+        # 区切りが崩れたPDF向けの保守的フォールバック。
+        m_room = re.search(r"(\d+)$", house_number)
+        room = m_room.group(1) if m_room else ""
 
     # 一棟の建物の「所在」を物件住所として取得。東京23区は登記簿で都道府県が
     # 省略されるため「東京都」を補う。
@@ -309,14 +368,20 @@ def analyze_registry(pdf_text: str) -> dict:
             built_year = built_date[:4]
 
     acquired_date = ""
+    current_owner_name = ""
     owner_entries = []
     for e in _entries(kou):
         if re.search(r"所有権(?:移転|保存)|持分(?:全部|一部)?移転", e["flat"]):
             dm = re.search(r"原因((?:明治|大正|昭和|平成|令和)\d+年\d+月\d+日)", e["flat"])
-            if dm:
-                owner_entries.append((e["rank"], jp_date_to_iso(dm.group(1))))
+            owner_entries.append({
+                "rank": e["rank"],
+                "date": jp_date_to_iso(dm.group(1)) if dm else "",
+                "name": _extract_party_name(e["flat"], "所有者"),
+            })
     if owner_entries:
-        acquired_date = sorted(owner_entries, key=lambda x: x[0])[-1][1]
+        latest_owner = sorted(owner_entries, key=lambda x: x["rank"])[-1]
+        acquired_date = latest_owner["date"]
+        current_owner_name = latest_owner["name"]
 
     mortgage_entries = _entries(otsu)
     settings = {}
@@ -361,7 +426,7 @@ def analyze_registry(pdf_text: str) -> dict:
             date_iso = _extract_loan_date(e)
             rate_found = _extract_interest_rate(e["flat"])
             rate = rate_found if rate_found is not None else 2.3
-            bal = estimate_remaining_balance(amount, date_iso, rate, years=35)
+            bal = estimate_remaining_balance(amount, date_iso, rate, years=35, as_of=_date_after_months(date.today(), 3))
             payment = calculate_monthly_payment(amount, rate, years=35)
             total_balance += bal
             total_monthly_payment += payment
@@ -378,13 +443,39 @@ def analyze_registry(pdf_text: str) -> dict:
         estimated_balance = total_balance
         monthly_payment = total_monthly_payment
         if len(active) > 1:
-            warnings.append(f"有効な抵当権が{len(active)}件あります。推定残債は全件を合算しています。ローン会社等の表示は最新順位です。")
+            warnings.append(f"有効な抵当権が{len(active)}件あります。推定残債はExcelの「2か月後」欄に入る月時点で全件を合算しています。ローン会社等の表示は最新順位です。")
     else:
-        # 現在有効な抵当権がなければ、推定残債は0円。
+        # 現在有効な抵当権がない場合、現所有者本人が過去に設定した抵当権だけを
+        # 「過去抵当あり（抹消済み）」として表示する。前所有者の抵当は引き継がない。
         estimated_balance = 0
         monthly_payment = 0
-        if settings:
-            warnings.append("乙区の抵当権設定はすべて抹消済みと判定しました。推定残債は0円です。")
+        historical_current_owner = []
+        for rank, e in sorted(settings.items()):
+            if rank not in cancelled:
+                continue
+            debtor = _extract_party_name(e["flat"], "債務者")
+            setting_date = _extract_loan_date(e)
+            # 名義一致を主条件にし、取得日前の設定は除外する。
+            if _same_party(debtor, current_owner_name) and (not acquired_date or not setting_date or setting_date >= acquired_date):
+                historical_current_owner.append(e)
+
+        if historical_current_owner:
+            chosen = historical_current_owner[-1]
+            loan_company = _extract_lender(chosen["flat"])
+            loan_amount = _extract_amount_yen(chosen["flat"]) or 0
+            loan_date = _extract_loan_date(chosen)
+            explicit_rate = _extract_interest_rate(chosen["flat"])
+            interest_rate = explicit_rate if explicit_rate is not None else 2.3
+            interest_rate_source = "登記記載（抹消済み）" if explicit_rate is not None else "既定2.3%（抹消済み）"
+            mortgage_details.append({
+                "rank": chosen["rank"], "company": loan_company, "amount_yen": loan_amount,
+                "loan_date": loan_date, "interest_rate": interest_rate,
+                "interest_rate_source": interest_rate_source,
+                "estimated_balance_yen": 0, "monthly_payment_yen": 0, "status": "cancelled_current_owner",
+            })
+            warnings.append("現所有者が過去に設定した抵当権は抹消済みです。過去の借入内容を表示し、現在残債は0円としています。")
+        elif settings:
+            warnings.append("現在有効な抵当権はありません。過去の抵当権は現所有者のものではないため、ローン情報には使用しません。")
 
     checks = {
         "物件名": bool(property_name), "号室": bool(room), "何階建て": bool(floors),
@@ -407,6 +498,7 @@ def analyze_registry(pdf_text: str) -> dict:
         "current_owner_acquired_date": acquired_date,
         "current_owner_acquired_date_slash": (lambda parts: f"{int(parts[0])}/{int(parts[1])}/{int(parts[2])}")(acquired_date.split("-")) if acquired_date else "",
         "purchase_date": (lambda parts: f"{int(parts[0])}/{int(parts[1])}/{int(parts[2])}")(acquired_date.split("-")) if acquired_date else "",
+        "current_owner_name": current_owner_name,
         "loan_company": loan_company,
         "loan_amount_yen": loan_amount,
         "tax_basis_amount_yen": tax_basis_amount,
@@ -417,6 +509,7 @@ def analyze_registry(pdf_text: str) -> dict:
         "monthly_payment_yen": monthly_payment,
         "mortgage_details": mortgage_details,
         "active_mortgage_count": len(active),
+        "mortgage_status": "active" if active else ("cancelled_current_owner" if mortgage_details else "none"),
         "cancelled_mortgage_ranks": sorted(cancelled),
         "warnings": warnings,
     }
