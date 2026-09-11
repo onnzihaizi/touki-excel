@@ -479,7 +479,7 @@ with st.sidebar:
     st.caption("業務用 登記簿入力ツール")
     st.divider()
     st.markdown("**▣ 登記簿入力**")
-    st.caption("Ver.3.8.12 / 最大7物件対応・空欄セル自動生成修正")
+    st.caption("Ver.3.8.13 / 最大7物件対応・最新版Excelテンプレート")
     st.divider()
     st.success("OpenAI APIキー不要 / 利用料0円")
     st.info("住所・総戸数・管理会社は手入力。HOME'S・マンションナビ確認リンク付き。現所有者の過去抵当が抹消済みの場合は、過去ローン情報を残しExcelのローン欄をグレー表示します。")
