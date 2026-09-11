@@ -352,13 +352,41 @@ def fill_cs_template(results: list[dict]) -> bytes:
     if gray_refs:
         styles_xml, sheet_xml = _gray_style_map(styles_xml, sheet_xml, gray_refs, prefix)
 
+    # セルの数式を削除・差し替えた後に古い calcChain.xml を残すと、
+    # Excel が「一部の内容に問題があります」と修復を要求することがある。
+    # 計算チェーンはExcel側で自動再生成できるため、出力時に安全に削除する。
+    calc_chain_name = "xl/calcChain.xml"
+    wb_rels_name = "xl/_rels/workbook.xml.rels"
+    content_types_name = "[Content_Types].xml"
+
+    wb_rels_xml = zin.read(wb_rels_name).decode("utf-8")
+    wb_rels_xml = re.sub(
+        r'<Relationship\b[^>]*Type="[^"]*/calcChain"[^>]*/>',
+        "",
+        wb_rels_xml,
+        flags=re.S,
+    )
+    content_types_xml = zin.read(content_types_name).decode("utf-8")
+    content_types_xml = re.sub(
+        r'<Override\b[^>]*PartName="/xl/calcChain\.xml"[^>]*/>',
+        "",
+        content_types_xml,
+        flags=re.S,
+    )
+
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
+            if item.filename == calc_chain_name:
+                continue
             if item.filename == sheet_name:
                 data = sheet_xml.encode("utf-8")
             elif item.filename == styles_name:
                 data = styles_xml
+            elif item.filename == wb_rels_name:
+                data = wb_rels_xml.encode("utf-8")
+            elif item.filename == content_types_name:
+                data = content_types_xml.encode("utf-8")
             else:
                 data = zin.read(item.filename)
             zout.writestr(item, data)
