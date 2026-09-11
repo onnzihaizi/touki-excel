@@ -667,10 +667,18 @@ if "results" in st.session_state:
 
     st.divider()
     xlsx = fill_cs_template(edited_results)
+
+    # 1件目の登記簿から取得した現所有者名をダウンロードファイル名に使用
+    owner_name = str(edited_results[0].get("current_owner_name") or "").strip() if edited_results else ""
+    if owner_name:
+        # Windows / macOS でファイル名に使えない文字を安全に除去
+        owner_name = re.sub(r'[\\/:*?"<>|\r\n\t]+', '', owner_name).strip(' .')
+    download_filename = f"CS_{owner_name}様.xlsx" if owner_name else "CS_登記簿自動入力.xlsx"
+
     st.download_button(
         f"⬇ {len(edited_results)}物件を入力したCS Excelを作成",
         data=xlsx,
-        file_name="CS_登記簿自動入力.xlsx",
+        file_name=download_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         type="primary",
