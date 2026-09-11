@@ -91,13 +91,67 @@ def _cell_xml(ref, value, style=None, prefix=""):
 
 
 
+def _col_to_num(col: str) -> int:
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n
+
+
+def _num_to_col(n: int) -> str:
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _ensure_cell(sheet_xml: str, ref: str, prefix="") -> str:
+    """空欄セルがXML上に存在しない場合でも、左側の同型セルのスタイルを引き継いで作成する。"""
+    p = re.escape(prefix)
+    cell_pat = rf'<{p}c\b[^>]*\br="{re.escape(ref)}"[^>]*(?:/>|>.*?</{p}c>)'
+    if re.search(cell_pat, sheet_xml, flags=re.S):
+        return sheet_xml
+
+    mref = re.fullmatch(r'([A-Z]+)(\d+)', ref)
+    if not mref:
+        raise ValueError(f"セル参照 {ref} が不正です。")
+    col, row = mref.group(1), mref.group(2)
+
+    # 物件枠は3列刻みなので、まず3列左の同じ行からスタイルを引き継ぐ。
+    style = None
+    col_num = _col_to_num(col)
+    candidates = []
+    if col_num > 3:
+        candidates.append(f"{_num_to_col(col_num - 3)}{row}")
+    # 念のため、さらに左の既存セルも探索。
+    candidates += [f"{_num_to_col(n)}{row}" for n in range(col_num - 1, 0, -1)]
+    seen = set()
+    for src in candidates:
+        if src in seen:
+            continue
+        seen.add(src)
+        sm = re.search(rf'<{p}c\b([^>]*\br="{re.escape(src)}"[^>]*)', sheet_xml, flags=re.S)
+        if sm:
+            ssm = re.search(r'\bs="([^"]+)"', sm.group(1) or "")
+            if ssm:
+                style = ssm.group(1)
+            break
+
+    row_pat = rf'(<{p}row\b[^>]*\br="{row}"[^>]*>)(.*?)(</{p}row>)'
+    rm = re.search(row_pat, sheet_xml, flags=re.S)
+    if not rm:
+        raise ValueError(f"テンプレート内に行 {row} が見つかりませんでした。")
+    new_cell = _cell_xml(ref, "", style, prefix)
+    return sheet_xml[:rm.start()] + rm.group(1) + rm.group(2) + new_cell + rm.group(3) + sheet_xml[rm.end():]
+
+
 def _replace_formula_cell(sheet_xml: str, ref: str, formula: str, prefix="") -> str:
     """指定セルへ数式を必ず再設定する（既存スタイルは維持）。"""
+    sheet_xml = _ensure_cell(sheet_xml, ref, prefix)
     p = re.escape(prefix)
     pat = rf'<{p}c\b([^>]*\br="{re.escape(ref)}"[^>]*)/>|<{p}c\b([^>]*\br="{re.escape(ref)}"[^>/]*)>(.*?)</{p}c>'
     m = re.search(pat, sheet_xml, flags=re.S)
-    if not m:
-        raise ValueError(f"テンプレート内にセル {ref} が見つかりませんでした。")
     attrs = (m.group(1) or m.group(2) or "")
     sm = re.search(r'\bs="([^"]+)"', attrs)
     style_attr = f' s="{sm.group(1)}"' if sm else ""
@@ -106,11 +160,10 @@ def _replace_formula_cell(sheet_xml: str, ref: str, formula: str, prefix="") -> 
     return sheet_xml[:m.start()] + new_xml + sheet_xml[m.end():]
 
 def _replace_cell(sheet_xml: str, ref: str, value, prefix="") -> str:
+    sheet_xml = _ensure_cell(sheet_xml, ref, prefix)
     p = re.escape(prefix)
     pat = rf'<{p}c\b([^>]*\br="{re.escape(ref)}"[^>]*)/>|<{p}c\b([^>]*\br="{re.escape(ref)}"[^>/]*)>(.*?)</{p}c>'
     m = re.search(pat, sheet_xml, flags=re.S)
-    if not m:
-        raise ValueError(f"テンプレート内にセル {ref} が見つかりませんでした。")
     attrs = (m.group(1) or m.group(2) or "")
     sm = re.search(r'\bs="([^"]+)"', attrs)
     style = sm.group(1) if sm else None
@@ -426,7 +479,7 @@ with st.sidebar:
     st.caption("業務用 登記簿入力ツール")
     st.divider()
     st.markdown("**▣ 登記簿入力**")
-    st.caption("Ver.3.8.11 / 最大7物件対応")
+    st.caption("Ver.3.8.12 / 最大7物件対応・空欄セル自動生成修正")
     st.divider()
     st.success("OpenAI APIキー不要 / 利用料0円")
     st.info("住所・総戸数・管理会社は手入力。HOME'S・マンションナビ確認リンク付き。現所有者の過去抵当が抹消済みの場合は、過去ローン情報を残しExcelのローン欄をグレー表示します。")
